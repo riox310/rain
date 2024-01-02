@@ -1,0 +1,11 @@
+Model Information:
+* title:	Ice Cream Car Low_Poly
+* source:	https://sketchfab.com/3d-models/ice-cream-car-low-poly-83900ff5231944569eda3ee2bc98a230
+* author:	Sidra (https://sketchfab.com/Sidramax)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Ice Cream Car Low_Poly" (https://sketchfab.com/3d-models/ice-cream-car-low-poly-83900ff5231944569eda3ee2bc98a230) by Sidra (https://sketchfab.com/Sidramax) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

@@ -1,0 +1,876 @@
+import * as THREE from 'three';
+import { tslFn, texture, uv, uint, positionWorld, modelWorldMatrix, cameraViewMatrix, timerLocal, timerDelta, cameraProjectionMatrix, vec2, instanceIndex, positionGeometry, storage, MeshBasicNodeMaterial, If } from 'three/nodes';
+import WebGPU from 'three/addons/capabilities/WebGPU.js';
+import WebGPURenderer from 'three/addons/renderers/webgpu/WebGPURenderer.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import Stats from 'three/addons/libs/stats.module.js';
+
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+import * as YUKA from 'yuka';
+
+const maxParticleCount = 100000;
+const instanceCount = maxParticleCount / 2;
+
+let camera, scene, renderer;
+let cam2, cam3, cam4;
+let controls,controls2, stats;
+let computeParticles;
+let monkey;
+let clock;
+let activeCamera;
+
+let cloudParticles = [];
+let flash;
+
+
+let  collisionCamera, collisionPosRT, collisionPosMaterial;
+
+const mixers = [], objects = [];
+let model, animations;
+let car1,car2,car3,car4,car5,bike1;
+let vehicle,onPathBehavior,followPathBehavior;
+
+let  entityManager;
+
+init();
+animate();
+function init() {
+
+    if ( WebGPU.isAvailable() === false ) {
+
+        document.body.appendChild( WebGPU.getErrorMessage() );
+
+        throw new Error( 'No WebGPU support' );
+
+    }
+
+    const { innerWidth, innerHeight } = window;
+
+    camera = new THREE.PerspectiveCamera( 60, innerWidth / innerHeight, .1, 1100 );
+    camera.position.set( 40, 8, 0 );
+    camera.lookAt( 0, 0, 0 );
+
+    //activeCamera = camera;
+
+    cam2 = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+    cam3 = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+    cam4 = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+
+    scene = new THREE.Scene();
+    const skyLoader = new THREE.TextureLoader();
+	const environmentMap = skyLoader.load('sky.jpg'); 
+    scene.background = environmentMap;
+
+    activeCamera = camera;
+
+    //
+    
+    const sunGeometry = new THREE.SphereGeometry( 1.5, 16, 8);
+    const sunLoader = new THREE.TextureLoader();
+	const sunTexture = sunLoader.load("sun.jpg");
+    const sunMaterial = new THREE.MeshBasicMaterial({ map: sunTexture });
+
+    const dirLight = new THREE.DirectionalLight( 0xffffff, .5 );
+    dirLight.castShadow = true;
+    dirLight.add( new THREE.Mesh( sunGeometry, sunMaterial ) );
+    dirLight.position.set( 3, 40, 17 );
+    dirLight.castShadow = true;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.camera.right = 25;
+    dirLight.shadow.camera.left = - 25;
+    dirLight.shadow.camera.top = 25;
+    dirLight.shadow.camera.bottom = - 25;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.bias = - 0.01;
+
+
+    scene.add( dirLight );
+    scene.add( new THREE.AmbientLight( 0x111111 ) );
+
+    //
+    
+
+    collisionCamera = new THREE.OrthographicCamera( - 50, 50, 50, - 50, .1, 50 );
+    collisionCamera.position.y = 50;
+    collisionCamera.lookAt( 0, 0, 0 );
+    collisionCamera.layers.disableAll();
+    collisionCamera.layers.enable( 1 );
+
+    collisionPosRT = new THREE.RenderTarget( 1024, 1024 );
+    collisionPosRT.texture.type = THREE.HalfFloatType;
+
+    collisionPosMaterial = new MeshBasicNodeMaterial();
+    collisionPosMaterial.colorNode = positionWorld;
+
+    //
+
+    const createBuffer = ( type = 'vec3' ) => storage( new THREE.InstancedBufferAttribute( new Float32Array( maxParticleCount * 4 ), 4 ), type, maxParticleCount );
+
+    const positionBuffer = createBuffer();
+    const velocityBuffer = createBuffer();
+    const ripplePositionBuffer = createBuffer();//vi tri vo nuod
+    const rippleTimeBuffer = createBuffer();//thoi gian the hien hieu ung vo nuoc
+
+    // compute
+
+    const timer = timerLocal();
+
+    const randUint = () => uint( Math.random() * 0xFFFFFF );
+
+    const computeInit = tslFn( () => {
+
+        const position = positionBuffer.element( instanceIndex );
+        const velocity = velocityBuffer.element( instanceIndex );
+        const rippleTime = rippleTimeBuffer.element( instanceIndex );
+
+        const randX = instanceIndex.hash();
+        const randY = instanceIndex.add( randUint() ).hash();
+        const randZ = instanceIndex.add( randUint() ).hash();
+
+        position.x = randX.mul( 200 ).add( - 50 );
+        position.y = randY.mul( 25 );
+        position.z = randZ.mul( 200 ).add( -50 );
+
+        velocity.y = randX.mul( - .04 ).add( - .2 );
+
+        rippleTime.x = 1000;
+
+    } )().compute( maxParticleCount );
+
+    //
+
+    const computeUpdate = tslFn( () => {
+
+        const getCoord = ( pos ) => pos.add( 50 ).div( 100 );
+
+        const position = positionBuffer.element( instanceIndex );
+        const velocity = velocityBuffer.element( instanceIndex );
+        const ripplePosition = ripplePositionBuffer.element( instanceIndex );
+        const rippleTime = rippleTimeBuffer.element( instanceIndex );
+
+        position.addAssign( velocity );
+
+        rippleTime.x = rippleTime.x.add( timerDelta().mul( 4 ) );
+
+        //
+
+        const collisionArea = texture( collisionPosRT.texture, getCoord( position.xz ) );
+
+        const surfaceOffset = .05;
+
+        const floorPosition = collisionArea.y.add( surfaceOffset );
+
+        // floor
+
+        const ripplePivotOffsetY = - .9;
+
+        If( position.y.add( ripplePivotOffsetY ).lessThan( floorPosition ), () => {
+
+            position.y = 25;
+
+            ripplePosition.x = position.x;
+            ripplePosition.y = floorPosition;
+            ripplePosition.z = position.z;
+
+            // reset hit time: x = time
+
+            rippleTime.x = 1;
+
+            // next drops will not fall in the same place
+
+            position.x = instanceIndex.add( timer ).hash().mul( 200 ).add( - 50 );
+            position.z = instanceIndex.add( timer.add( randUint() ) ).hash().mul( 200 ).add( - 50 );
+
+        } );
+
+        const rippleOnSurface = texture( collisionPosRT.texture, getCoord( ripplePosition.xz ) );
+
+        const rippleFloorArea = rippleOnSurface.y.add( surfaceOffset );
+
+        If( ripplePosition.y.greaterThan( rippleFloorArea ), () => {
+
+            rippleTime.x = 1000;
+
+        } );
+
+    } );
+
+    computeParticles = computeUpdate().compute( maxParticleCount );
+
+    // rain
+
+    const billboarding = tslFn( () => {
+
+        const particlePosition = positionBuffer.toAttribute();
+
+        const worldMatrix = modelWorldMatrix.toVar();
+        worldMatrix[ 3 ][ 0 ] = particlePosition.x;
+        worldMatrix[ 3 ][ 1 ] = particlePosition.y;
+        worldMatrix[ 3 ][ 2 ] = particlePosition.z;
+
+        const modelViewMatrix = cameraViewMatrix.mul( worldMatrix );
+        modelViewMatrix[ 0 ][ 0 ] = 1;
+        modelViewMatrix[ 0 ][ 1 ] = 0;
+        modelViewMatrix[ 0 ][ 2 ] = 0;
+
+        //modelViewMatrix[ 0 ][ 0 ] = modelWorldMatrix[ 0 ].length();
+        //modelViewMatrix[ 1 ][ 1 ] = modelWorldMatrix[ 1 ].length();
+
+        modelViewMatrix[ 2 ][ 0 ] = 0;
+        modelViewMatrix[ 2 ][ 1 ] = 0;
+        modelViewMatrix[ 2 ][ 2 ] = 1;
+
+        return cameraProjectionMatrix.mul( modelViewMatrix ).mul( positionGeometry );
+
+    } );
+
+    const rainMaterial = new MeshBasicNodeMaterial();
+    rainMaterial.colorNode = uv().distance( vec2( .5, 0 ) ).oneMinus().mul( 3 ).exp().mul( .1 );
+    rainMaterial.vertexNode = billboarding();
+    rainMaterial.opacity = .2;
+    rainMaterial.side = THREE.DoubleSide;
+    rainMaterial.forceSinglePass = true;
+    rainMaterial.depthWrite = false;
+    rainMaterial.depthTest = true;
+    rainMaterial.transparent = true;
+
+    const rainParticles = new THREE.Mesh( new THREE.PlaneGeometry( .1, 2 ), rainMaterial );
+    rainParticles.isInstancedMesh = true;
+    rainParticles.count = instanceCount;
+    scene.add( rainParticles );
+
+    // ripple
+
+    const rippleTime = rippleTimeBuffer.element( instanceIndex ).x;
+
+    const rippleEffect = tslFn( () => {
+
+        const center = uv().add( vec2( - .5 ) ).length().mul( 30 );
+        const distance = rippleTime.sub( center );
+
+        return distance.min( 1 ).sub( distance.max( 1 ).sub( 1 ) );
+
+    } );
+
+    const rippleMaterial = new MeshBasicNodeMaterial();
+    rippleMaterial.colorNode = rippleEffect();
+    rippleMaterial.positionNode = positionGeometry.add( ripplePositionBuffer.toAttribute() );
+    rippleMaterial.opacityNode = rippleTime.mul( .3 ).oneMinus().max( 0 ).mul( .5 );
+    rippleMaterial.side = THREE.DoubleSide;
+    rippleMaterial.forceSinglePass = true;
+    rippleMaterial.depthWrite = false;
+    rippleMaterial.depthTest = true;
+    rippleMaterial.transparent = true;
+
+    // ripple geometry
+
+    const surfaceRippleGeometry = new THREE.PlaneGeometry( 2.5, 2.5 );
+    surfaceRippleGeometry.rotateX( - Math.PI / 2 );
+
+    const xRippleGeometry = new THREE.PlaneGeometry( 1, 2 );
+    xRippleGeometry.rotateY( - Math.PI / 2 );
+
+    const zRippleGeometry = new THREE.PlaneGeometry( 1, 2 );
+
+    const rippleGeometry = BufferGeometryUtils.mergeGeometries( [ surfaceRippleGeometry, xRippleGeometry, zRippleGeometry ] );
+
+    const rippleParticles = new THREE.Mesh( rippleGeometry, rippleMaterial );
+    rippleParticles.isInstancedMesh = true;
+    rippleParticles.count = instanceCount;
+    scene.add( rippleParticles );
+
+    // floor geometry
+
+    const floorGeometry = new THREE.PlaneGeometry( 1000, 1000 );
+    floorGeometry.rotateX( - Math.PI / 2 );
+
+    const plane = new THREE.Mesh( floorGeometry, new THREE.MeshLambertMaterial( { color: 0x050505 } ) );
+    plane.receiveShadow = true;
+    
+    scene.add( plane );
+
+    //tao lighting
+    flash = new THREE.DirectionalLight(0xffeedd,.5);
+    flash.position.set(0,30,0);
+    scene.add(flash);
+    
+
+
+
+
+
+    const loader = new GLTFLoader();
+   
+   
+    loader.load("umbrella/123/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(4, 4, 4);
+        gltf.scene.position.set(-20, 2, 22);
+        gltf.scene.rotation.y = 2.6;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow =true;
+        })
+        airplane =gltf.scene;
+       
+
+    });
+    const loader1 = new GLTFLoader();
+   
+   
+    loader1.load("umbrella/123/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+
+        gltf.scene.scale.set(4, 4, 4);
+        gltf.scene.position.set(-20, 2,-2);
+        gltf.scene.rotation.y = 1.2;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow =true;
+        })
+        airplane =gltf.scene;
+       
+
+    });
+    const loader2 = new GLTFLoader();
+   
+   
+    loader2.load("street/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(1, 1, 1);
+        gltf.scene.position.set(-5, 6, 10);
+      
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+    
+       
+
+    });
+
+    //
+    const loader3 = new GLTFLoader();
+   
+   
+    loader3.load("light/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(1, 1, 1);
+        gltf.scene.position.set(-18, 2, 22);
+        gltf.scene.rotation.y = 2.6;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+    
+       
+
+    });
+
+    const loader4 = new GLTFLoader();
+   
+   
+    loader4.load("light/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(1, 1, 1);
+        gltf.scene.position.set(7, 2, 22);
+        gltf.scene.rotation.y = 2.6;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+    
+       
+
+    });
+    
+
+    const loader5 = new GLTFLoader();
+   
+   
+    loader5.load("light/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(1, 1, 1);
+        gltf.scene.position.set(-18, 2, -2);
+        gltf.scene.rotation.y = 1.2;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+
+    
+       
+
+    });
+    
+
+    const loader6 = new GLTFLoader();
+   
+   
+    loader6.load("light/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(1, 1, 1);
+        gltf.scene.position.set(7, 2, -2);
+        gltf.scene.rotation.y = 0.6;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+    
+       
+
+    });
+
+    vehicle = new YUKA.Vehicle();
+
+    function sync(entity, renderComponent) {
+        renderComponent.matrix.copy(entity.worldMatrix);
+    }
+    
+    const path = new YUKA.Path();
+    path.add( new YUKA.Vector3(-3, 1.9, 120));
+    path.add( new YUKA.Vector3(-3, 1.9, 19));
+    path.add( new YUKA.Vector3(80, 1.9, 19));
+    path.add( new YUKA.Vector3(80, 1.9, 120));
+    path.loop = true;
+
+    vehicle.position.copy(path.current());
+
+    vehicle.maxSpeed = 20;
+    followPathBehavior = new YUKA.FollowPathBehavior(path, 15); // Chỉnh độ nhạy khi gặp khúc cua (càng cao thì cua càng sớm)
+    vehicle.steering.add(followPathBehavior);
+    onPathBehavior = new YUKA.OnPathBehavior(path);
+    vehicle.steering.add(onPathBehavior);
+    
+    entityManager = new YUKA.EntityManager();
+    entityManager.add(vehicle);
+    const position = [];
+    for(let i = 0; i < path._waypoints.length; i++) {
+        const waypoint = path._waypoints[i];
+        position.push(waypoint.x, waypoint.y, waypoint.z);
+    }
+ 
+    
+    // Add Umbrella
+    // Add street
+   
+    // Add vehicles
+    const loaderCar1 = new GLTFLoader();
+
+    loaderCar1.load("car1/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(0.025, 0.025, 0.025);
+        gltf.scene.position.set(0, 1.9, 6);
+        gltf.scene.rotation.y = - Math.PI / 2.0;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+        car1 = gltf.scene;
+    
+    });
+    const loaderCar2 = new GLTFLoader();
+
+    loaderCar2.load("car1/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(0.025, 0.025, 0.025);
+        gltf.scene.position.set(20, 2, 6);
+        gltf.scene.rotation.y = - Math.PI / 2.0;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+        car2 = gltf.scene;
+    
+    });
+
+    const loaderCar3 = new GLTFLoader();
+
+    loaderCar3.load("car2/scene.gltf", (gltf) => {
+        scene.add(gltf.scene);
+        gltf.scene.scale.set(0.008, 0.008, 0.008);
+        gltf.scene.position.set(0, 2.35, 12);
+        //gltf.scene.rotation.y = - Math.PI / 1;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+        car3 = gltf.scene;
+    
+    });
+
+    const loaderCar4 = new GLTFLoader();
+
+    loaderCar4.load("car3/scene.gltf", (gltf) => {
+        car4 = gltf.scene;
+        scene.add(gltf.scene);
+        car4.add(cam2);
+        cam2.position.set(0, 3, +10);
+		//cam2.rotation.x = - Math.PI / -2.0;
+        gltf.scene.scale.set(1,1,1);
+        gltf.scene.position.set(-20, 4, 12);
+        gltf.scene.rotation.y = - Math.PI / 2;
+        gltf.scene.castShadow = true;
+        gltf.scene.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+        
+    
+    });
+    // Car 5
+    const loaderCar5 = new GLTFLoader();
+
+    loaderCar5.load("car1/scene.gltf", function (gltf) {
+        car5 = gltf.scene;
+        scene.add(gltf.scene);
+        car5.matrixAutoUpdate = false;
+        vehicle.scale = new YUKA.Vector3(0.025, 0.025, 0.025);
+        vehicle.setRenderComponent(car5, sync);
+        //car5.position.set(0, 1.9, 50);
+        car5.rotation.y = - Math.PI / -1;
+        car5.castShadow = true;
+        car5.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+    
+    });
+    const loaderBike1 = new GLTFLoader();
+
+    loaderBike1.load("bike1/scene.gltf", function (gltf) {
+        bike1 = gltf.scene;
+        scene.add(gltf.scene);
+        bike1.add(cam3);
+        cam3.position.set(+4, 3, 0);
+        cam3.rotation.y = - Math.PI / -2.0;
+
+        gltf.scene.scale.set(1, 1, 1);
+        bike1.position.set(-11, 1.9, -10);
+        //bike1.rotation.y = - Math.PI / -2.0;
+        bike1.castShadow = true;
+        bike1.traverse(function(object){
+            object.layers.enable(1);
+            object.castShadow = true;
+        })
+ 
+    
+    });
+  
+
+
+    
+    
+    
+    const pole2 = new THREE.PointLight(0xffe699,10);
+    pole2.castShadow = false;
+    pole2.position.set(-18,8,22);
+    scene.add(pole2);
+
+    const pole3 = new THREE.PointLight(0xffe699,10);
+    pole3.castShadow = false;
+    pole3.position.set(7,8,22);
+    scene.add(pole3);
+
+    const pole4 = new THREE.PointLight(0xffe699,10);
+    pole4.castShadow = false;
+    pole4.position.set(7,8,-2);
+    scene.add(pole4);
+
+    const pole5 = new THREE.PointLight(0xffe699,10);
+    pole5.castShadow = false;
+    pole5.position.set(-18,8,-2);
+    scene.add(pole5);
+
+    clock = new THREE.Clock();
+    const loaderRobo = new GLTFLoader();
+    loaderRobo.load( 'models/gltf/Soldier.glb', function ( gltf ) {
+
+        model = gltf.scene;
+        model.scale.set(2, 2, 2);
+
+        animations = gltf.animations;
+        model.rotation.y=22;
+        model.traverse( function ( object ) {
+
+            if ( object.isMesh ) object.castShadow = true;
+
+        } );
+
+        setupDefaultScene();
+        
+
+    } );
+
+
+    //
+
+    renderer = new WebGPURenderer( { antialias: true } );
+    renderer.setPixelRatio( window.devicePixelRatio );
+    renderer.setSize( window.innerWidth, window.innerHeight );
+    renderer.setAnimationLoop( animate );
+    document.body.appendChild( renderer.domElement );
+    stats = new Stats();
+    document.body.appendChild( stats.dom );
+
+    //
+
+    renderer.compute( computeInit );
+
+    //
+
+    controls = new OrbitControls( camera, renderer.domElement );
+    controls.minDistance = 1;
+    controls.maxDistance = 1000;
+
+    controls.update(); 
+
+
+    //
+  
+    window.addEventListener( 'resize', onWindowResize );
+
+    // gui
+
+    const gui = new GUI();
+
+    // use lerp to smooth the movement
+    
+    //gui.add( rainParticles, 'count', 200, maxParticleCount, 1 ).name( 'drop count' ).onChange( ( v ) => rippleParticles.count = v );
+    gui.add(rainParticles, 'count', 200, maxParticleCount, 1).name('drop count').onChange((v) => {
+        rippleParticles.count = v;
+    
+        // Tính toán màu nền dựa trên số lượng hạt mưa
+        const maxCount = maxParticleCount;
+        const normalizedCount = v / maxCount;
+        const startColor = new THREE.Color(0xa0a0a0);
+        const endColor = new THREE.Color(0, 0, 0);
+        const lerpedColor = new THREE.Color(
+            startColor.r + normalizedCount * (endColor.r - startColor.r),
+            startColor.g + normalizedCount * (endColor.g - startColor.g),
+            startColor.b + normalizedCount * (endColor.b - startColor.b)
+        );
+    
+        // Đặt màu nền
+        scene.background = lerpedColor;
+    });
+    
+    
+    
+    
+
+
+    function setupDefaultScene() {
+    // three cloned models with independent skeletons.
+    // each model can have its own animation state
+    const model1 = SkeletonUtils.clone( model );
+   
+    cam4.position.set(0, 2, +3);
+    //cam4.rotation.y = - Math.PI / 2.0;
+    const model2 = SkeletonUtils.clone( model );
+
+    model2.add(cam4);
+
+   
+
+    model1.position.x = 6;
+    model1.position.y =2;
+    model1.position.z=-10;
+
+    model2.position.x = -17;
+    model2.position.y =2;
+    model2.position.z=-20;
+
+    
+    const mixer1 = new THREE.AnimationMixer( model1 );
+    const mixer2 = new THREE.AnimationMixer( model2 );
+    mixer1.clipAction( animations[3] ).play(); // idle
+    mixer2.clipAction( animations[1] ).play(); // idle
+
+    scene.add( model1,model2 );
+
+    objects.push( model1,model2 );
+    mixers.push( mixer1,mixer2 );
+
+    window.addEventListener('keydown', onKeyDown);
+}
+
+
+}
+
+function onWindowResize() {
+
+    const { innerWidth, innerHeight } = window;
+
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+
+    renderer.setSize( innerWidth, innerHeight );
+
+}
+
+function onKeyDown(event) {
+    switch (event.key) {
+        case '1':
+            activeCamera = camera; // Full screen
+            break;
+        case '2':
+            activeCamera = cam2; // 
+            break;
+        case '3':
+            activeCamera = cam3; //  
+            break;
+        case '4':
+            activeCamera = cam4;
+            break;
+    }
+}
+
+
+
+function checkCollision(car1, car2, car3, car4,robo1,robo2) {
+ 
+
+    const box1 = new THREE.Box3().setFromObject(car1);
+    const box2 = new THREE.Box3().setFromObject(car2);
+    const box3 = new THREE.Box3().setFromObject(car3);
+    const box4 = new THREE.Box3().setFromObject(car4);
+    const box5 = new THREE.Box3().setFromObject(robo1);//walk
+    const box6 = new THREE.Box3().setFromObject(robo2);//run
+    
+    
+    
+
+    if (box1.intersectsBox(box2)) {
+        // Nếu có va chạm, điều chỉnh vị trí của xe để tránh giao nhau
+        car1.position.x -= 0.4;
+        car2.position.x += 0.4;
+    }
+      if (box3.intersectsBox(box4)) {
+        // Nếu có va chạm, điều chỉnh vị trí của xe để tránh giao nhau
+        car3.position.x += 0.5;
+        car4.position.x -= 0.5;
+        if(box5.intersectsBox(box1) || box5.intersectsBox(box2) || box5.intersectsBox(box3) || box5.intersectsBox(box4))
+        {
+            robo1.position.z -=0.5;
+
+        }
+        if(box6.intersectsBox(box1) || box6.intersectsBox(box2) || box6.intersectsBox(box3) || box6.intersectsBox(box4))
+        {
+            robo2.position.z -=0.5;
+            
+        }
+    }
+}
+
+function animate() {
+
+    stats.update();
+
+    const delta = clock.getDelta();
+   
+    objects[0].position.z+=0.03;
+    objects[1].position.z+=0.06;
+    if(objects[0].position.z>30){
+        objects[0].position.z=-10;
+        objects[0].position.x = 6;
+
+    }
+    if(objects[1].position.z>30){
+        objects[1].position.z=-20;
+        objects[1].position.x = -17;
+
+    }
+
+    for ( const mixer of mixers ) mixer.update( delta );
+
+    const time = new YUKA.Time();
+    const delta2 = time.update().getDelta();
+    entityManager.update(delta);
+
+    checkCollision(car1, car2, car3, car4,objects[0],objects[1]);
+
+    
+    if(car1.position.x < -100){
+		car1.position.x = 100;
+	} else {
+		car1.position.x -= 0.1;
+	}
+
+    if(car2.position.x < -100){
+		car2.position.x = 70;
+	} else {
+		car2.position.x -= 0.3;
+	}
+
+     if(car3.position.x > 100){
+		car3.position.x = -100;
+	} else {
+		car3.position.x += 0.2;
+	}
+
+    if(car4.position.x > 100){
+		car4.position.x = -70;
+	} else {
+		car4.position.x += 0.4;
+	}
+
+    if(bike1.position.z > 1){
+        bike1.rotation.y = 0.0;
+        
+		bike1.position.x -= 0.1 ;
+        if (bike1.position.x < -60){
+            bike1.rotation.y = Math.PI / 2.0;
+            bike1.position.z = - 40;
+            bike1.position.x = - 12;
+        }
+	} else {
+		bike1.position.z += 0.1;
+	}
+
+    cloudParticles.forEach((p) =>{
+        p.rotate.z -= 0.002;
+
+    });
+    if(Math.random() > 0.98 || flash.power > 100){
+        if(flash.power < 100)
+        flash.position.set(Math.random() * 400,300, + Math.random()*200,100);
+        flash.power = 50 + Math.random() *500;
+    }
+
+
+
+
+    // position
+    //scene.background = new THREE.Color( 0xa0a0a0 );
+    scene.overrideMaterial = collisionPosMaterial;
+    renderer.setRenderTarget( collisionPosRT );
+    renderer.render( scene, collisionCamera );
+
+    // compute
+
+    renderer.compute( computeParticles );
+
+    // result
+    
+
+    scene.overrideMaterial = null;
+    renderer.setRenderTarget( null );
+    renderer.render( scene, activeCamera );
+
+}
